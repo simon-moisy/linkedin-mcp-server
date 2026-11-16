@@ -101,3 +101,41 @@ class TestDetectConnectionState:
         assert (
             detect_connection_state(self._signals(labeled_action=True)) == "unavailable"
         )
+
+
+class TestInviteAnchorLabel:
+    """The one label value read: Connect and Pending are both labeled
+    anchors linking to the profile (#1494)."""
+
+    def test_connect_label_is_connectable_not_pending(self):
+        from linkedin_mcp_server.linkedin.connection import (
+            detect_connection_state,
+            invite_anchor_label,
+        )
+
+        label = invite_anchor_label(["Invite Jane Doe to connect"])
+        assert label == "Invite Jane Doe to connect"
+        signals = ActionSignals(
+            has_invite_anchor=False,
+            has_compose_anchor_in_action_root=True,
+            has_edit_intro_anchor=False,
+            has_labeled_action_button=False,
+            has_labeled_action_anchor=True,
+            has_incoming_action_row=False,
+            invite_anchor_label=label,
+        )
+        assert detect_connection_state(signals) == "connectable"
+
+    def test_pending_and_unknown_labels_never_match(self):
+        from linkedin_mcp_server.linkedin.connection import invite_anchor_label
+
+        assert (
+            invite_anchor_label(
+                [
+                    "Pending, click to withdraw invitation sent to Jane Doe",
+                    "Jane Doe einladen, sich zu vernetzen",
+                    "",
+                ]
+            )
+            is None
+        )

@@ -206,6 +206,7 @@ ACTION_SIGNALS_JS = (
   let hasComposeInActionRoot = false;
   let hasLabeledActionButton = false;
   let hasLabeledActionAnchor = false;
+  const actionAnchorLabels = [];
   if (actionRoot) {
     hasComposeInActionRoot =
       !!actionRoot.querySelector('a[href*="/messaging/compose/"]');
@@ -218,7 +219,7 @@ ACTION_SIGNALS_JS = (
     for (const a of actionRoot.querySelectorAll('a')) {
       if (a.hasAttribute('aria-label')) {
         hasLabeledActionAnchor = true;
-        break;
+        actionAnchorLabels.push(a.getAttribute('aria-label') || '');
       }
     }
   }
@@ -229,8 +230,35 @@ ACTION_SIGNALS_JS = (
     hasEditIntro,
     hasLabeledActionButton,
     hasLabeledActionAnchor,
+    actionAnchorLabels,
     hasIncomingActionRow: !!findIncomingActionRow(main),
   };
+})
+"""
+)
+
+# Click the labeled Connect anchor in the action root (November 2026 layout,
+# upstream issue #1494). The anchor is picked by its exact aria-label, which
+# Python has already matched against the per-locale Connect table, so a
+# control that turned into Pending between the read and the click is not
+# found and nothing is clicked: the Pending control withdraws an invitation.
+CLICK_LABELED_INVITE_ANCHOR_JS = (
+    r"""
+((label) => {
+"""
+    + _FIND_ACTION_ROOT_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return false;
+  const actionRoot = findActionRoot(main);
+  if (!actionRoot) return false;
+  for (const a of actionRoot.querySelectorAll('a[aria-label]')) {
+    if (a.getAttribute('aria-label') === label) {
+      a.click();
+      return true;
+    }
+  }
+  return false;
 })
 """
 )
@@ -544,7 +572,32 @@ class ConnectionActions:
             has_labeled_action_button=bool(data.get("hasLabeledActionButton")),
             has_labeled_action_anchor=bool(data.get("hasLabeledActionAnchor")),
             has_incoming_action_row=bool(data.get("hasIncomingActionRow")),
+            invite_anchor_label=connection.invite_anchor_label(
+                [
+                    label
+                    for label in data.get("actionAnchorLabels") or []
+                    if isinstance(label, str)
+                ]
+            ),
         )
+
+    async def _click_labeled_invite_anchor(self, label: str) -> bool:
+        """Click the top-card Connect anchor carrying exactly *label*.
+
+        Returns True iff the click landed and an invite dialog opened.
+        """
+        try:
+            clicked = await self._session.run_on_linkedin(
+                CLICK_LABELED_INVITE_ANCHOR_JS, label
+            )
+        except OffLinkedInLandingError:
+            raise
+        except Exception:
+            logger.debug("Connect anchor click via JS failed", exc_info=True)
+            return False
+        if not clicked:
+            return False
+        return await self._dialog_is_open(timeout=5000)
 
     async def _submit_invite_dialog(
         self, note: str | None
@@ -911,7 +964,7 @@ class ConnectionActions:
         # deeplink only as a non-submitting probe so we can report the Premium
         # note-quota block without accidentally sending from a follow-only or
         # otherwise unavailable profile.
-        if not signals.has_invite_anchor:
+        if not signals.can_invite:
             if note:
                 logger.info(
                     "No visible invite anchor for %s; probing custom-invite deeplink "
@@ -935,7 +988,16 @@ class ConnectionActions:
                 profile=page_text,
             )
 
-        await self._navigator._navigate_to_page(invite_url)
+        # November 2026 layout: Connect is a labeled anchor with no invite
+        # URL. Clicking it opens the same invite dialog on the profile page.
+        # The deeplink stays the fallback when the click opens nothing.
+        dialog_opened = False
+        if not signals.has_invite_anchor and signals.invite_anchor_label is not None:
+            dialog_opened = await self._click_labeled_invite_anchor(
+                signals.invite_anchor_label
+            )
+        if not dialog_opened:
+            await self._navigator._navigate_to_page(invite_url)
 
         submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
             note
@@ -958,7 +1020,7 @@ class ConnectionActions:
 
         verified = await self._read_main_profile(username)
         verified_signals = await self._read_action_signals(username)
-        if verified_signals.has_invite_anchor:
+        if verified_signals.can_invite:
             # The same settle retry as the accept path: an immediate re-read
             # can still render Connect for an invitation LinkedIn already
             # recorded (observed live 2026-09-26: send_failed, then Pending).
@@ -975,7 +1037,7 @@ class ConnectionActions:
         verified_text = verified.get("sections", {}).get("main_profile", "")
         verified_state = connection.detect_connection_state(verified_signals)
 
-        if verified_signals.has_invite_anchor:
+        if verified_signals.can_invite:
             return _connection_result(
                 url,
                 "send_failed",

@@ -79,6 +79,7 @@ def _signals(
     labeled_action: bool = False,
     labeled_anchor: bool = False,
     incoming_row: bool = False,
+    invite_label: str | None = None,
 ) -> ActionSignals:
     return ActionSignals(
         has_invite_anchor=invite,
@@ -87,6 +88,7 @@ def _signals(
         has_labeled_action_button=labeled_action,
         has_labeled_action_anchor=labeled_anchor,
         has_incoming_action_row=incoming_row,
+        invite_anchor_label=invite_label,
     )
 
 
@@ -495,6 +497,122 @@ class TestConnectWithPerson:
         assert result["status"] == "connect_unavailable"
         mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
+
+    async def test_labeled_connect_anchor_is_clicked_and_verified(self, mock_page):
+        """November 2026 layout (#1494): Connect is a labeled <a> with no
+        invite URL. The anchor is clicked, the dialog submitted, and the
+        profile must then stop offering Connect."""
+        label = "Invite Jane Doe to connect"
+        text = "Jane\n\n· 2nd\n\nEngineer\n\nConnect\nMessage\nMore\n"
+        post_text = "Jane\n\n· 2nd\n\nEngineer\n\nPending\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text, post_text))
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    _signals(compose=True, labeled_anchor=True, invite_label=label),
+                    _signals(compose=True, labeled_anchor=True),
+                ],
+            ),
+            patch.object(
+                PageNavigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                actions,
+                "_click_labeled_invite_anchor",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_click,
+            patch.object(
+                actions,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=(True, False, None),
+            ),
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "connected"
+        assert "pending" in result["message"]
+        mock_click.assert_awaited_once_with(label)
+        mock_nav.assert_not_awaited()
+
+    async def test_labeled_connect_anchor_send_failed_when_it_persists(self, mock_page):
+        """The Connect anchor is still there after submit and settle → the
+        invite is reported as not sent, never as pending."""
+        label = "Invite Jane Doe to connect"
+        text = "Jane\n\n· 2nd\n\nEngineer\n\nConnect\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text, text, text))
+        still = _signals(compose=True, labeled_anchor=True, invite_label=label)
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=still,
+            ),
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(
+                actions,
+                "_click_labeled_invite_anchor",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                actions,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=(True, False, None),
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.connection_actions.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "send_failed"
+
+    async def test_labeled_connect_anchor_falls_back_to_deeplink(self, mock_page):
+        """The anchor click opened no dialog → the deeplink is tried."""
+        label = "Invite Jane Doe to connect"
+        text = "Jane\n\n· 2nd\n\nEngineer\n\nConnect\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text, text))
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[
+                    _signals(compose=True, labeled_anchor=True, invite_label=label),
+                    _signals(compose=True, labeled_anchor=True),
+                ],
+            ),
+            patch.object(
+                PageNavigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                actions,
+                "_click_labeled_invite_anchor",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions,
+                "_submit_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=(True, False, None),
+            ),
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "connected"
+        mock_nav.assert_awaited_once()
 
     async def test_returns_pending(self, mock_page):
         """Profile with a pending invitation: detected via labeled <a> in
