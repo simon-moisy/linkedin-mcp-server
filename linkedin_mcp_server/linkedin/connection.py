@@ -120,11 +120,21 @@ class ActionSignals:
     from a label value, because Connect and Pending are otherwise the same
     element (see the table). ``None`` when no label matched."""
 
+    menu_invite_label: str | None = None
+    """The same label read from inside an open More menu: a
+    ``[role="menuitem"]`` that carries it, or holds an element that does.
+    Follow-first profiles keep Connect there, again with no invite URL.
+    ``None`` when the menu is closed or no label matched."""
+
     @property
     def can_invite(self) -> bool:
-        """LinkedIn exposes a way to invite: the invite URL or the labeled
-        Connect anchor."""
-        return self.has_invite_anchor or self.invite_anchor_label is not None
+        """LinkedIn exposes a way to invite: the invite URL, the labeled
+        Connect anchor, or the Connect item of an open More menu."""
+        return (
+            self.has_invite_anchor
+            or self.invite_anchor_label is not None
+            or self.menu_invite_label is not None
+        )
 
 
 def detect_connection_state(signals: ActionSignals) -> ConnectionState:

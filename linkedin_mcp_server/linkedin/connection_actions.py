@@ -240,6 +240,19 @@ ACTION_SIGNALS_JS = (
     }
   }
 
+  // Labels inside an open More menu (portal-rendered, so document-wide).
+  // Follow-first profiles keep Connect there as a menuitem holding a
+  // labeled element, with no invite URL (measured live 2026-11-16).
+  const menuItemLabels = [];
+  for (const item of document.querySelectorAll('[role="menu"] [role="menuitem"]')) {
+    if (item.hasAttribute('aria-label')) {
+      menuItemLabels.push(item.getAttribute('aria-label') || '');
+    }
+    for (const el of item.querySelectorAll('[aria-label]')) {
+      menuItemLabels.push(el.getAttribute('aria-label') || '');
+    }
+  }
+
   return {
     hasInvite,
     hasComposeInActionRoot,
@@ -247,6 +260,7 @@ ACTION_SIGNALS_JS = (
     hasLabeledActionButton,
     hasLabeledActionAnchor,
     actionAnchorLabels,
+    menuItemLabels,
     hasIncomingActionRow: !!findIncomingActionRow(main),
   };
 })
@@ -324,6 +338,26 @@ CLICK_INCOMING_ACCEPT_JS = (
 })
 """
 )
+
+# Click the Connect item of the open More menu: the menuitem that carries
+# exactly *label*, or holds an element that does. Same guard as the anchor
+# click: the label was matched in Python against the Connect table, so a
+# Pending item (which withdraws) is never the one found.
+CLICK_MENU_INVITE_ITEM_JS = r"""
+((label) => {
+  for (const item of document.querySelectorAll('[role="menu"] [role="menuitem"]')) {
+    const own = item.getAttribute('aria-label') === label;
+    const held = [...item.querySelectorAll('[aria-label]')].some(
+      (el) => el.getAttribute('aria-label') === label
+    );
+    if (own || held) {
+      item.click();
+      return true;
+    }
+  }
+  return false;
+})
+"""
 
 
 def _connection_result(
@@ -595,7 +629,65 @@ class ConnectionActions:
                     if isinstance(label, str)
                 ]
             ),
+            menu_invite_label=connection.invite_anchor_label(
+                [
+                    label
+                    for label in data.get("menuItemLabels") or []
+                    if isinstance(label, str)
+                ]
+            ),
         )
+
+    async def _read_signals_behind_more(self, username: str) -> ActionSignals | None:
+        """Read the signals with the More menu open, then close it.
+
+        Returns None when the menu could not be opened, so a caller never
+        takes a closed menu for one that no longer offers Connect.
+        """
+        if not await self._open_more_menu():
+            return None
+        signals = await self._read_action_signals(username)
+        try:
+            await self._press_escape()
+        except OffLinkedInLandingError:
+            raise
+        except Exception:
+            logger.debug("Escape after More-menu reread failed", exc_info=True)
+        return signals
+
+    async def _click_menu_invite_item(self, label: str) -> bool:
+        """Open the More menu and click its Connect item carrying *label*.
+
+        Returns True iff the click landed and the profile invite dialog
+        opened.
+        """
+        if not await self._open_more_menu():
+            return False
+        try:
+            clicked = await self._session.run_on_linkedin(
+                CLICK_MENU_INVITE_ITEM_JS, label
+            )
+        except OffLinkedInLandingError:
+            raise
+        except Exception:
+            logger.debug("More-menu Connect click via JS failed", exc_info=True)
+            clicked = False
+        if not clicked:
+            try:
+                await self._press_escape()
+            except OffLinkedInLandingError:
+                raise
+            except Exception:
+                logger.debug("Escape after a missed menu click failed", exc_info=True)
+            return False
+        try:
+            await self._session.page.wait_for_selector(
+                _PROFILE_INVITE_DIALOG_SELECTOR, state="visible", timeout=5000
+            )
+            return True
+        except PlaywrightTimeoutError:
+            logger.debug("Profile invite dialog did not open from the More menu")
+            return False
 
     async def _click_labeled_invite_anchor(self, label: str) -> bool:
         """Click the top-card Connect anchor carrying exactly *label*.
@@ -1046,14 +1138,17 @@ class ConnectionActions:
         # there without a note. A note, or a click that opens nothing, takes
         # the deeplink as before.
         dialog_opened = False
-        if (
-            not note
-            and not signals.has_invite_anchor
-            and signals.invite_anchor_label is not None
-        ):
-            dialog_opened = await self._click_labeled_invite_anchor(
-                signals.invite_anchor_label
-            )
+        via_menu = False
+        if not note and not signals.has_invite_anchor:
+            if signals.invite_anchor_label is not None:
+                dialog_opened = await self._click_labeled_invite_anchor(
+                    signals.invite_anchor_label
+                )
+            elif signals.menu_invite_label is not None:
+                dialog_opened = await self._click_menu_invite_item(
+                    signals.menu_invite_label
+                )
+                via_menu = dialog_opened
         if dialog_opened:
             submitted = await self._submit_profile_invite_dialog()
             note_sent, note_limit_message = False, None
@@ -1076,6 +1171,41 @@ class ConnectionActions:
                 "connect_unavailable",
                 "LinkedIn did not open a usable invite dialog for this profile.",
                 profile=page_text,
+            )
+
+        if via_menu:
+            # Sent from the More menu: the top card never changes (Follow
+            # stays the primary action), so the only evidence is the menu
+            # itself, which must no longer offer Connect.
+            verified = await self._read_main_profile(username)
+            menu_signals = await self._read_signals_behind_more(username)
+            if menu_signals is not None and menu_signals.can_invite:
+                await asyncio.sleep(3.0)
+                verified = await self._read_main_profile(username)
+                menu_signals = await self._read_signals_behind_more(username)
+            verified_text = verified.get("sections", {}).get("main_profile", "")
+            if menu_signals is None:
+                return _connection_result(
+                    url,
+                    "send_failed",
+                    "Submitted the invite dialog but could not reopen the More "
+                    "menu to confirm it. Check the profile before retrying.",
+                    profile=verified_text or page_text,
+                )
+            if menu_signals.can_invite:
+                return _connection_result(
+                    url,
+                    "send_failed",
+                    "Submitted the invite dialog but the More menu still offers "
+                    "Connect.",
+                    profile=verified_text or page_text,
+                )
+            return _connection_result(
+                url,
+                "connected",
+                "Connection request sent. State after send: pending "
+                "(the More menu no longer offers Connect).",
+                profile=verified_text or page_text,
             )
 
         verified = await self._read_main_profile(username)

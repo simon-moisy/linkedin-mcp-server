@@ -80,6 +80,7 @@ def _signals(
     labeled_anchor: bool = False,
     incoming_row: bool = False,
     invite_label: str | None = None,
+    menu_label: str | None = None,
 ) -> ActionSignals:
     return ActionSignals(
         has_invite_anchor=invite,
@@ -89,6 +90,7 @@ def _signals(
         has_labeled_action_anchor=labeled_anchor,
         has_incoming_action_row=incoming_row,
         invite_anchor_label=invite_label,
+        menu_invite_label=menu_label,
     )
 
 
@@ -649,6 +651,103 @@ class TestConnectWithPerson:
         assert result["status"] == "connected"
         mock_click.assert_not_awaited()
         mock_nav.assert_awaited_once()
+
+    async def test_follow_first_connect_item_in_more_menu_is_sent(self, mock_page):
+        """Follow-first profile, November 2026 layout: Connect is a More-menu
+        item with a label and no invite URL. It is clicked, the profile
+        dialog submitted, and the menu must then stop offering Connect."""
+        label = "Invite Jane Doe to connect"
+        text = "Jane\n\n· 2nd\n\nFounder\n\nFollow\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text, text))
+        follow = _signals(compose=True, labeled_action=True)
+        menu = _signals(compose=True, labeled_action=True, menu_label=label)
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[follow, menu],
+            ),
+            patch.object(
+                actions, "_open_more_menu", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(actions, "_press_escape", new_callable=AsyncMock),
+            patch.object(
+                PageNavigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as mock_nav,
+            patch.object(
+                actions,
+                "_click_menu_invite_item",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_click,
+            patch.object(
+                actions,
+                "_submit_profile_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                actions,
+                "_read_signals_behind_more",
+                new_callable=AsyncMock,
+                return_value=follow,
+            ),
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "connected"
+        mock_click.assert_awaited_once_with(label)
+        mock_nav.assert_not_awaited()
+
+    async def test_more_menu_send_failed_when_menu_still_offers_connect(
+        self, mock_page
+    ):
+        label = "Invite Jane Doe to connect"
+        text = "Jane\n\n· 2nd\n\nFounder\n\nFollow\nMessage\nMore\n"
+        actions = _actions(mock_page, _reads(text, text, text))
+        follow = _signals(compose=True, labeled_action=True)
+        menu = _signals(compose=True, labeled_action=True, menu_label=label)
+
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                side_effect=[follow, menu],
+            ),
+            patch.object(
+                actions, "_open_more_menu", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(actions, "_press_escape", new_callable=AsyncMock),
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(
+                actions,
+                "_click_menu_invite_item",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                actions,
+                "_submit_profile_invite_dialog",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                actions,
+                "_read_signals_behind_more",
+                new_callable=AsyncMock,
+                return_value=menu,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.connection_actions.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await actions.connect_with_person("testuser")
+
+        assert result["status"] == "send_failed"
 
     async def test_returns_pending(self, mock_page):
         """Profile with a pending invitation: detected via labeled <a> in
