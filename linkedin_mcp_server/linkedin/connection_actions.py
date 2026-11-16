@@ -58,6 +58,22 @@ _DIALOG_SELECTOR = f'dialog[open]{_NOT_MESSAGING}, [role="dialog"]{_NOT_MESSAGIN
 _DIALOG_PREMIUM_LINK_SELECTOR = (
     'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
 )
+# The invite dialog the labeled Connect anchor opens on the profile page
+# itself (November 2026 layout, upstream issue #1494). A profile page always
+# carries other dialogs: an open ``<dialog>`` that only holds a labeled
+# Dismiss button (the notification toast region), a visible
+# ``[role="dialog"]`` for the search history and hidden video-player ones, so
+# ``_DIALOG_SELECTOR`` is true before anything was clicked and its last
+# button belongs to none of them. Measured live 2026-11-16: the invite dialog
+# is the one open ``<dialog>`` holding an unlabeled ``<button>`` ("Send
+# without a note", the last one); Dismiss is labeled and "Add a note" is an
+# ``<a>``.
+_PROFILE_INVITE_DIALOG_SELECTOR = (
+    f"dialog[open]:has(button:not([aria-label])){_NOT_MESSAGING}"
+)
+_PROFILE_INVITE_SEND_SELECTOR = (
+    f"{_PROFILE_INVITE_DIALOG_SELECTOR} button:not([aria-label])"
+)
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
 
 # Shared JS function that walks up from any /messaging/compose/ anchor
@@ -584,7 +600,8 @@ class ConnectionActions:
     async def _click_labeled_invite_anchor(self, label: str) -> bool:
         """Click the top-card Connect anchor carrying exactly *label*.
 
-        Returns True iff the click landed and an invite dialog opened.
+        Returns True iff the click landed and the profile invite dialog
+        opened.
         """
         try:
             clicked = await self._session.run_on_linkedin(
@@ -597,7 +614,43 @@ class ConnectionActions:
             return False
         if not clicked:
             return False
-        return await self._dialog_is_open(timeout=5000)
+        try:
+            await self._session.page.wait_for_selector(
+                _PROFILE_INVITE_DIALOG_SELECTOR, state="visible", timeout=5000
+            )
+            return True
+        except PlaywrightTimeoutError:
+            logger.debug("Profile invite dialog did not open after the click")
+            return False
+
+    async def _submit_profile_invite_dialog(self) -> bool:
+        """Send, without a note, from the invite dialog opened on the profile.
+
+        Clicks the last unlabeled button of the profile invite dialog and
+        waits for that dialog to close. Owns cleanup: a dialog that could
+        not be submitted is dismissed.
+        """
+        buttons = self._session.page.locator(_PROFILE_INVITE_SEND_SELECTOR)
+        try:
+            count = await buttons.count()
+            if count == 0:
+                await self._press_escape()
+                return False
+            async with linkedin_element(buttons.nth(count - 1), timeout=5000) as send:
+                await send.click(timeout=5000)
+        except OffLinkedInLandingError:
+            raise
+        except Exception:
+            logger.debug("Profile invite send click failed", exc_info=True)
+            await self._press_escape()
+            return False
+        try:
+            await self._session.page.wait_for_selector(
+                _PROFILE_INVITE_DIALOG_SELECTOR, state="hidden", timeout=5000
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("Profile invite dialog did not close after submit")
+        return True
 
     async def _submit_invite_dialog(
         self, note: str | None
@@ -989,19 +1042,26 @@ class ConnectionActions:
             )
 
         # November 2026 layout: Connect is a labeled anchor with no invite
-        # URL. Clicking it opens the same invite dialog on the profile page.
-        # The deeplink stays the fallback when the click opens nothing.
+        # URL. Clicking it opens an invite dialog on the profile page, sent
+        # there without a note. A note, or a click that opens nothing, takes
+        # the deeplink as before.
         dialog_opened = False
-        if not signals.has_invite_anchor and signals.invite_anchor_label is not None:
+        if (
+            not note
+            and not signals.has_invite_anchor
+            and signals.invite_anchor_label is not None
+        ):
             dialog_opened = await self._click_labeled_invite_anchor(
                 signals.invite_anchor_label
             )
-        if not dialog_opened:
+        if dialog_opened:
+            submitted = await self._submit_profile_invite_dialog()
+            note_sent, note_limit_message = False, None
+        else:
             await self._navigator._navigate_to_page(invite_url)
-
-        submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
-            note
-        )
+            submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
+                note
+            )
         if note_limit_message is not None:
             return _connection_result(
                 url,
